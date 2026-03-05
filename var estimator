@@ -1,0 +1,643 @@
+"""
+Portfolio Value at Risk (VaR) and Expected Shortfall (ES / CVaR) Engine
+
+Features
+--------
+1. Build portfolio returns from multi-asset price data
+2. Compute:
+   - Historical simulation VaR / ES
+   - Gaussian (parametric) VaR / ES
+3. Generate rolling out-of-sample VaR forecasts
+4. Backtest VaR forecasts using:
+   - Exceedance counts
+   - Kupiec unconditional coverage test
+   - Christoffersen independence test
+   - Christoffersen conditional coverage test
+5. Visualise:
+   - Return distribution with VaR thresholds
+   - Loss series vs VaR forecast with exceedance markers
+
+Dependencies
+------------
+pip install numpy pandas matplotlib scipy
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import norm, chi2
+
+
+# ---------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------
+
+def _validate_confidence(alpha: float) -> None:
+    if not (0.0 < alpha < 1.0):
+        raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+
+
+def _alpha_label(alpha: float) -> str:
+    return str(int(round(alpha * 100)))
+
+
+def _safe_quantile(x: np.ndarray, q: float) -> float:
+    """
+    Compatibility wrapper for numpy quantile across versions.
+    """
+    try:
+        return float(np.quantile(x, q, method="linear"))
+    except TypeError:
+        return float(np.quantile(x, q, interpolation="linear"))
+
+
+def _clip_prob(p: float, eps: float = 1e-12) -> float:
+    return float(np.clip(p, eps, 1.0 - eps))
+
+
+# ---------------------------------------------------------------------
+# Risk metric functions
+# ---------------------------------------------------------------------
+
+def historical_var_es(returns: pd.Series, alpha: float) -> Tuple[float, float]:
+    """
+    Historical simulation VaR and ES using empirical losses.
+
+    Parameters
+    ----------
+    returns : pd.Series
+        Daily portfolio returns.
+    alpha : float
+        Confidence level, e.g. 0.95 or 0.99.
+
+    Returns
+    -------
+    (var, es) : tuple[float, float]
+        Positive loss magnitudes.
+        Example: 0.023 means a 2.3% one-day loss threshold.
+    """
+    _validate_confidence(alpha)
+
+    r = returns.dropna().to_numpy(dtype=float)
+    if r.size == 0:
+        raise ValueError("returns series is empty after dropping NaNs")
+
+    losses = -r
+    var = _safe_quantile(losses, alpha)
+
+    tail_losses = losses[losses >= var]
+    es = float(tail_losses.mean()) if tail_losses.size > 0 else var
+
+    return float(var), float(es)
+
+
+def gaussian_var_es(returns: pd.Series, alpha: float) -> Tuple[float, float]:
+    """
+    Parametric (Gaussian) VaR and ES under a normal return assumption.
+
+    For returns R ~ N(mu, sigma^2), the lower-tail return quantile is:
+        q_p = mu + sigma * z_p, where p = 1 - alpha
+    VaR is expressed as a positive loss:
+        VaR_alpha = -q_p
+
+    ES for the lower tail:
+        ES_alpha = -(mu - sigma * phi(z_p) / p)
+
+    Parameters
+    ----------
+    returns : pd.Series
+        Daily portfolio returns.
+    alpha : float
+        Confidence level.
+
+    Returns
+    -------
+    (var, es) : tuple[float, float]
+        Positive loss magnitudes.
+    """
+    _validate_confidence(alpha)
+
+    r = returns.dropna().to_numpy(dtype=float)
+    if r.size == 0:
+        raise ValueError("returns series is empty after dropping NaNs")
+
+    mu = float(np.mean(r))
+    sigma = float(np.std(r, ddof=1))
+    tail_prob = 1.0 - alpha
+
+    if sigma == 0.0:
+        var = max(0.0, -mu)
+        es = var
+        return var, es
+
+    z_tail = norm.ppf(tail_prob)  # negative for tail_prob < 0.5
+    pdf_z = norm.pdf(z_tail)
+
+    var = -(mu + sigma * z_tail)
+    es = -(mu - sigma * (pdf_z / tail_prob))
+
+    return float(var), float(es)
+
+
+# ---------------------------------------------------------------------
+# Backtesting diagnostics
+# ---------------------------------------------------------------------
+
+def kupiec_uc_test(exceptions: pd.Series, alpha: float) -> Tuple[float, float]:
+    """
+    Kupiec unconditional coverage test.
+
+    H0: Exception probability equals expected tail probability p = 1 - alpha
+    Test statistic:
+        LR_uc = -2 * [ log L(p) - log L(p_hat) ] ~ chi^2(1)
+    """
+    _validate_confidence(alpha)
+
+    e = exceptions.dropna().astype(int).to_numpy()
+    n = len(e)
+    if n == 0:
+        return np.nan, np.nan
+
+    x = int(e.sum())
+    p = _clip_prob(1.0 - alpha)
+    p_hat = _clip_prob(x / n if n > 0 else 0.0)
+
+    log_l_null = (n - x) * np.log(1.0 - p) + x * np.log(p)
+    log_l_alt = (n - x) * np.log(1.0 - p_hat) + x * np.log(p_hat)
+
+    lr_uc = -2.0 * (log_l_null - log_l_alt)
+    p_value = 1.0 - chi2.cdf(lr_uc, df=1)
+
+    return float(lr_uc), float(p_value)
+
+
+def christoffersen_independence_test(exceptions: pd.Series) -> Tuple[float, float]:
+    """
+    Christoffersen independence test.
+
+    H0: Exceptions are independent over time (iid Bernoulli)
+    H1: Exceptions follow a first-order Markov chain
+
+    Uses transition counts:
+        n00, n01, n10, n11
+    """
+    e = exceptions.dropna().astype(int).to_numpy()
+    if len(e) < 2:
+        return np.nan, np.nan
+
+    prev = e[:-1]
+    curr = e[1:]
+
+    n00 = int(np.sum((prev == 0) & (curr == 0)))
+    n01 = int(np.sum((prev == 0) & (curr == 1)))
+    n10 = int(np.sum((prev == 1) & (curr == 0)))
+    n11 = int(np.sum((prev == 1) & (curr == 1)))
+
+    total = n00 + n01 + n10 + n11
+    if total == 0:
+        return np.nan, np.nan
+
+    pi = _clip_prob((n01 + n11) / total)
+    pi01 = _clip_prob(n01 / (n00 + n01) if (n00 + n01) > 0 else 0.0)
+    pi11 = _clip_prob(n11 / (n10 + n11) if (n10 + n11) > 0 else 0.0)
+
+    log_l_indep = (n00 + n10) * np.log(1.0 - pi) + (n01 + n11) * np.log(pi)
+    log_l_markov = (
+        n00 * np.log(1.0 - pi01)
+        + n01 * np.log(pi01)
+        + n10 * np.log(1.0 - pi11)
+        + n11 * np.log(pi11)
+    )
+
+    lr_ind = -2.0 * (log_l_indep - log_l_markov)
+    p_value = 1.0 - chi2.cdf(lr_ind, df=1)
+
+    return float(lr_ind), float(p_value)
+
+
+def christoffersen_cc_test(exceptions: pd.Series, alpha: float) -> Tuple[float, float]:
+    """
+    Christoffersen conditional coverage test:
+        LR_cc = LR_uc + LR_ind ~ chi^2(2)
+    """
+    lr_uc, _ = kupiec_uc_test(exceptions, alpha)
+    lr_ind, _ = christoffersen_independence_test(exceptions)
+
+    if np.isnan(lr_uc) or np.isnan(lr_ind):
+        return np.nan, np.nan
+
+    lr_cc = lr_uc + lr_ind
+    p_value = 1.0 - chi2.cdf(lr_cc, df=2)
+
+    return float(lr_cc), float(p_value)
+
+
+# ---------------------------------------------------------------------
+# Core engine
+# ---------------------------------------------------------------------
+
+@dataclass
+class PortfolioRiskEngine:
+    prices: pd.DataFrame
+    weights: Sequence[float]
+    return_type: str = "log"         # "log" or "arithmetic"
+    rebalance: str = "daily"         # "daily" or "buy_and_hold"
+
+    def __post_init__(self) -> None:
+        self.prices = self._validate_prices(self.prices)
+        self.weights = self._validate_weights(self.weights, self.prices.shape[1])
+        self.asset_returns = self._compute_asset_returns()
+        self.portfolio_returns = self._compute_portfolio_returns()
+
+    @staticmethod
+    def _validate_prices(prices: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(prices, pd.DataFrame):
+            raise TypeError("prices must be a pandas DataFrame")
+        if prices.empty:
+            raise ValueError("prices DataFrame is empty")
+        if prices.shape[1] < 1:
+            raise ValueError("prices must contain at least one asset column")
+        if prices.isnull().any().any():
+            prices = prices.ffill().dropna()
+        if not prices.index.is_monotonic_increasing:
+            prices = prices.sort_index()
+        if (prices <= 0).any().any():
+            raise ValueError("all prices must be strictly positive")
+        return prices.astype(float)
+
+    @staticmethod
+    def _validate_weights(weights: Sequence[float], n_assets: int) -> np.ndarray:
+        w = np.asarray(list(weights), dtype=float)
+        if w.ndim != 1:
+            raise ValueError("weights must be one-dimensional")
+        if len(w) != n_assets:
+            raise ValueError(f"expected {n_assets} weights, got {len(w)}")
+        if not np.isfinite(w).all():
+            raise ValueError("weights contain non-finite values")
+        if np.isclose(w.sum(), 0.0):
+            raise ValueError("weights sum to zero")
+        return w / w.sum()
+
+    def _compute_asset_returns(self) -> pd.DataFrame:
+        if self.return_type not in {"log", "arithmetic"}:
+            raise ValueError("return_type must be 'log' or 'arithmetic'")
+
+        if self.return_type == "log":
+            asset_returns = np.log(self.prices / self.prices.shift(1))
+        else:
+            asset_returns = self.prices.pct_change()
+
+        return asset_returns.dropna(how="any")
+
+    def _compute_portfolio_returns(self) -> pd.Series:
+        if self.rebalance not in {"daily", "buy_and_hold"}:
+            raise ValueError("rebalance must be 'daily' or 'buy_and_hold'")
+
+        if self.rebalance == "daily":
+            # Constant-mix rebalanced portfolio:
+            # portfolio return each day is weighted sum of asset returns.
+            portfolio_returns = self.asset_returns.dot(self.weights)
+            portfolio_returns.name = "portfolio_return"
+            return portfolio_returns
+
+        # Buy-and-hold portfolio:
+        # Construct NAV from initial weights and underlying price paths.
+        normalized = self.prices / self.prices.iloc[0]
+        nav = (normalized * self.weights).sum(axis=1)
+
+        if self.return_type == "log":
+            portfolio_returns = np.log(nav / nav.shift(1)).dropna()
+        else:
+            portfolio_returns = nav.pct_change().dropna()
+
+        portfolio_returns.name = "portfolio_return"
+        return portfolio_returns
+
+    def static_risk_report(self, alphas: Iterable[float] = (0.95, 0.99)) -> pd.DataFrame:
+        """
+        Compute in-sample VaR / ES at selected confidence levels using both methods.
+        """
+        r = self.portfolio_returns.dropna()
+        if r.empty:
+            raise ValueError("portfolio return series is empty")
+
+        stats = {
+            "observations": int(len(r)),
+            "mean_daily_return": float(r.mean()),
+            "daily_volatility": float(r.std(ddof=1)),
+            "skewness": float(r.skew()),
+            "excess_kurtosis": float(r.kurt()),
+        }
+
+        rows = []
+        for alpha in alphas:
+            _validate_confidence(alpha)
+
+            h_var, h_es = historical_var_es(r, alpha)
+            g_var, g_es = gaussian_var_es(r, alpha)
+
+            rows.append(
+                {
+                    "confidence": alpha,
+                    "historical_var": h_var,
+                    "historical_es": h_es,
+                    "gaussian_var": g_var,
+                    "gaussian_es": g_es,
+                    **stats,
+                }
+            )
+
+        df = pd.DataFrame(rows).set_index("confidence")
+        return df
+
+    def rolling_risk(
+        self,
+        window: int = 250,
+        alphas: Iterable[float] = (0.95, 0.99),
+        include_historical: bool = True,
+        include_gaussian: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Generate rolling one-step-ahead VaR / ES forecasts.
+
+        For each date t:
+            estimate on returns[t-window : t-1]
+            forecast VaR / ES for date t
+            compare with realized return at t
+        """
+        r = self.portfolio_returns.dropna()
+
+        if window < 30:
+            raise ValueError("window is too small; use at least 30 observations")
+        if window >= len(r):
+            raise ValueError("window must be smaller than the number of observations")
+        if not include_historical and not include_gaussian:
+            raise ValueError("at least one model must be enabled")
+
+        forecast_index = r.index[window:]
+        out = pd.DataFrame(index=forecast_index)
+        out["realized_return"] = r.iloc[window:]
+        out["realized_loss"] = -out["realized_return"]
+
+        for t in range(window, len(r)):
+            sample = r.iloc[t - window : t]
+            idx = r.index[t]
+
+            for alpha in alphas:
+                label = _alpha_label(alpha)
+
+                if include_historical:
+                    h_var, h_es = historical_var_es(sample, alpha)
+                    out.loc[idx, f"historical_var_{label}"] = h_var
+                    out.loc[idx, f"historical_es_{label}"] = h_es
+
+                if include_gaussian:
+                    g_var, g_es = gaussian_var_es(sample, alpha)
+                    out.loc[idx, f"gaussian_var_{label}"] = g_var
+                    out.loc[idx, f"gaussian_es_{label}"] = g_es
+
+        return out
+
+    def backtest(self, var_series: pd.Series, alpha: float, model_name: str = "VaR Model") -> pd.Series:
+        """
+        Backtest a VaR forecast series against realized portfolio losses.
+
+        Exception rule:
+            exception_t = 1{ loss_t > VaR_t }
+        """
+        _validate_confidence(alpha)
+
+        aligned = pd.concat(
+            [
+                (-self.portfolio_returns).rename("loss"),
+                var_series.rename("var"),
+            ],
+            axis=1,
+        ).dropna()
+
+        if aligned.empty:
+            raise ValueError("no overlapping observations between portfolio returns and var_series")
+
+        exceptions = aligned["loss"] > aligned["var"]
+        n = int(len(exceptions))
+        x = int(exceptions.sum())
+        expected = n * (1.0 - alpha)
+
+        lr_uc, p_uc = kupiec_uc_test(exceptions, alpha)
+        lr_ind, p_ind = christoffersen_independence_test(exceptions)
+        lr_cc, p_cc = christoffersen_cc_test(exceptions, alpha)
+
+        result = pd.Series(
+            {
+                "model": model_name,
+                "alpha": alpha,
+                "observations": n,
+                "exceptions": x,
+                "expected_exceptions": expected,
+                "exception_rate": x / n if n > 0 else np.nan,
+                "expected_exception_rate": 1.0 - alpha,
+                "kupiec_lr_uc": lr_uc,
+                "kupiec_p_value": p_uc,
+                "christoffersen_lr_ind": lr_ind,
+                "christoffersen_ind_p_value": p_ind,
+                "christoffersen_lr_cc": lr_cc,
+                "christoffersen_cc_p_value": p_cc,
+            },
+            name=model_name,
+        )
+
+        return result
+
+    def plot_return_distribution(
+        self,
+        alphas: Iterable[float] = (0.95, 0.99),
+        bins: int = 80,
+        figsize: tuple = (11, 6),
+    ) -> None:
+        """
+        Plot return histogram and overlay historical / Gaussian VaR thresholds
+        (drawn in return space as negative values).
+        """
+        r = self.portfolio_returns.dropna()
+        if r.empty:
+            raise ValueError("portfolio return series is empty")
+
+        plt.figure(figsize=figsize)
+        plt.hist(r, bins=bins, density=True, alpha=0.7)
+        plt.title("Portfolio Return Distribution with VaR Thresholds")
+        plt.xlabel("Daily Return")
+        plt.ylabel("Density")
+
+        for alpha in alphas:
+            label = _alpha_label(alpha)
+
+            h_var, _ = historical_var_es(r, alpha)
+            g_var, _ = gaussian_var_es(r, alpha)
+
+            # VaR is positive loss; convert back to return threshold = -VaR
+            plt.axvline(-h_var, linestyle="--", label=f"Historical VaR {label}%")
+            plt.axvline(-g_var, linestyle=":", label=f"Gaussian VaR {label}%")
+
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    def plot_backtest(
+        self,
+        var_series: pd.Series,
+        title: str = "VaR Backtest",
+        figsize: tuple = (12, 6),
+    ) -> None:
+        """
+        Plot realized losses against VaR and mark exceedances.
+        """
+        aligned = pd.concat(
+            [
+                (-self.portfolio_returns).rename("loss"),
+                var_series.rename("var"),
+            ],
+            axis=1,
+        ).dropna()
+
+        if aligned.empty:
+            raise ValueError("no overlapping observations between portfolio returns and var_series")
+
+        exceptions = aligned["loss"] > aligned["var"]
+
+        plt.figure(figsize=figsize)
+        plt.plot(aligned.index, aligned["loss"], label="Realized Loss")
+        plt.plot(aligned.index, aligned["var"], label="VaR Forecast")
+        plt.scatter(
+            aligned.index[exceptions],
+            aligned.loc[exceptions, "loss"],
+            marker="x",
+            s=50,
+            label="Exceedances",
+        )
+
+        plt.title(title)
+        plt.xlabel("Date")
+        plt.ylabel("Loss / VaR")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+
+# ---------------------------------------------------------------------
+# Example usage
+# ---------------------------------------------------------------------
+
+def generate_synthetic_prices(
+    n_days: int = 1500,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Generate synthetic multi-asset geometric price paths for demonstration.
+
+    This is useful for testing the engine without external data sources.
+    """
+    rng = np.random.default_rng(seed)
+
+    dates = pd.bdate_range("2020-01-01", periods=n_days)
+
+    # Daily mean returns
+    mu = np.array([0.0004, 0.0002, 0.0003])
+
+    # Daily covariance matrix
+    cov = np.array(
+        [
+            [0.00018, 0.00007, 0.00005],
+            [0.00007, 0.00012, 0.00004],
+            [0.00005, 0.00004, 0.00015],
+        ]
+    )
+
+    simulated_log_returns = rng.multivariate_normal(mean=mu, cov=cov, size=n_days)
+    log_price_paths = np.cumsum(simulated_log_returns, axis=0)
+    prices = 100.0 * np.exp(log_price_paths)
+
+    df = pd.DataFrame(
+        prices,
+        index=dates,
+        columns=["Asset_A", "Asset_B", "Asset_C"],
+    )
+    return df
+
+
+def main() -> None:
+    # -----------------------------------------------------------------
+    # Option 1: Replace this with your own data
+    # -----------------------------------------------------------------
+    # Example for real data:
+    # prices = pd.read_csv("prices.csv", index_col=0, parse_dates=True)
+    # weights = [0.50, 0.30, 0.20]
+
+    # -----------------------------------------------------------------
+    # Option 2: Synthetic demo data
+    # -----------------------------------------------------------------
+    prices = generate_synthetic_prices(n_days=1500)
+    weights = [0.50, 0.30, 0.20]
+
+    engine = PortfolioRiskEngine(
+        prices=prices,
+        weights=weights,
+        return_type="log",
+        rebalance="daily",
+    )
+
+    # In-sample risk summary
+    report = engine.static_risk_report(alphas=(0.95, 0.99))
+    print("\n=== STATIC RISK REPORT ===")
+    print(report.round(6))
+
+    # Rolling out-of-sample one-step-ahead risk forecasts
+    rolling = engine.rolling_risk(
+        window=250,
+        alphas=(0.95, 0.99),
+        include_historical=True,
+        include_gaussian=True,
+    )
+
+    print("\n=== ROLLING FORECAST SAMPLE ===")
+    print(rolling.tail().round(6))
+
+    # Backtest 99% historical VaR
+    hist_99_col = "historical_var_99"
+    gauss_99_col = "gaussian_var_99"
+
+    bt_hist_99 = engine.backtest(
+        var_series=rolling[hist_99_col],
+        alpha=0.99,
+        model_name="Historical VaR 99%",
+    )
+    bt_gauss_99 = engine.backtest(
+        var_series=rolling[gauss_99_col],
+        alpha=0.99,
+        model_name="Gaussian VaR 99%",
+    )
+
+    print("\n=== BACKTEST: HISTORICAL 99% ===")
+    print(bt_hist_99.round(6))
+
+    print("\n=== BACKTEST: GAUSSIAN 99% ===")
+    print(bt_gauss_99.round(6))
+
+    # Visual diagnostics
+    engine.plot_return_distribution(alphas=(0.95, 0.99))
+    engine.plot_backtest(
+        var_series=rolling[hist_99_col],
+        title="Historical 99% VaR Backtest",
+    )
+    engine.plot_backtest(
+        var_series=rolling[gauss_99_col],
+        title="Gaussian 99% VaR Backtest",
+    )
+
+
+if __name__ == "__main__":
+    main()
