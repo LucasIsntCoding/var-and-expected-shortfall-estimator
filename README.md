@@ -75,8 +75,3 @@ Implemented tests:
 - **Christoffersen (IND)**: checks exception independence (Markov vs iid)
 - **Christoffersen (CC)**: joint UC + IND
 
----
-
-## Repository Structure (Recommended)
-
-You can keep this as a single file, or structure it like:
